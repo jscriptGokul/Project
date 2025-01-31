@@ -1,53 +1,78 @@
 const express = require("express");
 const path = require("path");
 const http = require("http");
-const { Server } = require("socket.io");
-const sequelize = require("./config/database"); 
+const WebSocket = require("ws");
+const sequelize = require("./config/database");
 const Message = require("./models/Message");
 const authRoutes = require("./routes/authRoutes");
 const messageRoutes = require("./routes/messageRoutes");
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
+
+// WebSocket server
+const wss = new WebSocket.Server({ server });
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 app.use("/api/auth", authRoutes);
 app.use("/api", messageRoutes);
 
-io.on("connection", (socket) => {
+// Handle WebSocket connections
+wss.on("connection", (ws) => {
     console.log("A user connected");
 
     // Fetch chat history
-    Message.findAll({ order: [["timestamps", "ASC"]], limit: 50 })
-        .then(messages => socket.emit("chatHistory", messages));
+    Message.findAll({ order: [["createdAt", "ASC"]], limit: 50 })
+        .then(messages => ws.send(JSON.stringify({ type: "chatHistory", data: messages })));
 
     // Handle new user joining
-    socket.on("newuser", (username) => {
-        socket.broadcast.emit("update", `${username} joined the conversation`);
-    });
+    ws.on("message", (messageData) => {
+        const message = JSON.parse(messageData);
 
-    // Handle new chat messages
-    socket.on("chat", async (message) => {
-        try {
-            const savedMessage = await Message.create({
-                userId: message.userId, 
-                text: message.text
+        // New user joining
+        if (message.type === "newuser") {
+            const { username } = message;
+            wss.clients.forEach((client) => {
+                if (client !== ws && client.readyState === WebSocket.OPEN) {
+                    client.send(JSON.stringify({ type: "update", message: `${username} joined the conversation` }));
+                }
             });
-            io.emit("chat", savedMessage);
-        } catch (error) {
-            console.error("Error saving message:", error);
+        }
+
+        // Handle chat message
+        if (message.type === "chat") {
+            const { userId, text } = message;
+            Message.create({
+                userId: userId,
+                text: text
+            })
+            .then((savedMessage) => {
+                // Broadcast chat message to all connected clients
+                wss.clients.forEach((client) => {
+                    if (client !== ws && client.readyState === WebSocket.OPEN) {
+                        client.send(JSON.stringify({ type: "chat", data: savedMessage }));
+                    }
+                });
+            })
+            .catch((error) => {
+                console.error("Error saving message:", error);
+            });
+        }
+
+        // User leaving
+        if (message.type === "exituser") {
+            const { username } = message;
+            wss.clients.forEach((client) => {
+                if (client !== ws && client.readyState === WebSocket.OPEN) {
+                    client.send(JSON.stringify({ type: "update", message: `${username} left the conversation` }));
+                }
+            });
         }
     });
 
-    // Handle user leaving
-    socket.on("exituser", (username) => {
-        socket.broadcast.emit("update", `${username} left the conversation`);
-    });
-
-    // Handle disconnect
-    socket.on("disconnect", () => {
+    // Handle WebSocket disconnect
+    ws.on("close", () => {
         console.log("User disconnected");
     });
 });
